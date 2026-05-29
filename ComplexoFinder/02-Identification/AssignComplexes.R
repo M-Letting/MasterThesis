@@ -1,0 +1,2125 @@
+# Libraries
+library(data.table)
+library(dynamicTreeCut)
+library(limma)
+
+#' Discover complexoforms with peptide-only eBayes prior and direct pool variance
+#'
+#' Extension and correction of `discover_complexoforms_old` that cleanly separates
+#' the two variance components in the pooled-sibling test:
+#'
+#' - The **peptide SE** is estimated from each peptide's replicate variance and
+#'   shrunk toward a prior built exclusively from peptide-level variances across
+#'   all features and conditions, so the prior targets genuinely exchangeable
+#'   quantities (replicate noise within individual peptides).
+#'
+#' - The **pool SE** uses the raw LOO pool variance directly (no eBayes
+#'   shrinkage). Because the pool is the leave-one-out mean of all sibling
+#'   peptides, its variance naturally captures both measurement noise and
+#'   between-peptide profile variance (tau^2), which is exactly the
+#'   exchangeability-based H0 variance component required.
+#'
+#' The Satterthwaite degrees of freedom reflect these two distinct sources:
+#' `(d0 + df_i)` for the eBayes-moderated peptide component and `(Nex - 1)`
+#' for the direct pool estimate.
+#'
+#' @inheritParams discover_complexoforms
+#'
+#' @return A list with:
+#'
+#'   - `peptide_results`: data.table of peptide-level results with discordance
+#'     and dCF assignments.
+#'   - `condition_results`: data.table of per-condition tests (if requested).
+#'
+#' @export
+discover_complexoforms <- function(
+  complex_data,
+  intensity_cols,
+  group_col = "Gene name",
+  peptide_col = "Peptide",
+  alpha = 0.05,
+  adjust_method = "BH",
+  min_total_non_na_frac = 0.40,
+  min_conditions = 2,
+  min_reps_per_condition = 2,
+  deep_split = 2,
+  minClusterSize = 2,
+  cond_regex = "^(C_[0-9]+)_R_[0-9]+$",
+  canonical_label = "dCF0",
+  singleton_label = "dCF-1",
+  return_condition_tests = FALSE,
+  verbose = FALSE
+) {
+  if (!requireNamespace("data.table", quietly = TRUE)) {
+    stop("Please install data.table")
+  }
+  if (!requireNamespace("dynamicTreeCut", quietly = TRUE)) {
+    stop("Please install dynamicTreeCut")
+  }
+
+  DT <- data.table::as.data.table(complex_data)
+
+  # ---- ensure peptide ID ----
+  if (!peptide_col %in% names(DT)) {
+    needed_cols <- c(
+      "Accession",
+      "Position in master protein",
+      "Modifications in master protein",
+      "datatype"
+    )
+    if (all(needed_cols %in% names(DT))) {
+      DT[,
+        (peptide_col) := apply(.SD, 1, function(x) paste(x, collapse = "_")),
+        .SDcols = needed_cols
+      ]
+    } else {
+      stop(
+        "Cannot create peptide identifier column. Provide '",
+        peptide_col,
+        "' or columns: ",
+        paste(needed_cols, collapse = ", ")
+      )
+    }
+  }
+
+  if (!group_col %in% names(DT)) {
+    stop("Missing grouping column: ", group_col)
+  }
+  missing_int <- setdiff(intensity_cols, names(DT))
+  if (length(missing_int) > 0) {
+    stop("Missing intensity columns: ", paste(missing_int, collapse = ", "))
+  }
+
+  # ---- parse conditions ----
+  cond_chr <- sub(cond_regex, "\\1", intensity_cols, perl = TRUE)
+  if (any(cond_chr == intensity_cols)) {
+    alt_regex <- "^[A-Za-z0-9]+_[A-Za-z]+[0-9]+_(D[0-9]+)$"
+    cond_chr2 <- sub(alt_regex, "\\1", intensity_cols, perl = TRUE)
+    if (any(cond_chr2 == intensity_cols)) {
+      stop(
+        "Could not parse conditions from intensity_cols.\nTried cond_regex='",
+        cond_regex,
+        "' and alt_regex='",
+        alt_regex,
+        "'."
+      )
+    } else {
+      cond_chr <- cond_chr2
+      if (verbose) {
+        message(
+          "Auto-detected H9 format. Using condition pattern: D17, D19, etc."
+        )
+      }
+    }
+  }
+
+  cond <- factor(cond_chr)
+  cond_levels <- levels(cond)
+  K <- length(cond_levels)
+
+  # ---- helpers ----
+  .counts_by_condition <- function(Y) {
+    counts <- sapply(cond_levels, function(cc) {
+      cols_cc <- intensity_cols[cond == cc]
+      rowSums(!is.na(Y[, cols_cc, drop = FALSE]))
+    })
+    as.matrix(counts)
+  }
+
+  .double_bh_p <- function(p_row, min_m = 2) {
+    p <- p_row[is.finite(p_row)]
+    if (length(p) < min_m) {
+      return(NA_real_)
+    }
+    min(stats::p.adjust(p, method = "BH"))
+  }
+
+  .cluster_from_deviation <- function(Bd) {
+    if (nrow(Bd) < 2) {
+      return(setNames(rep(singleton_label, nrow(Bd)), rownames(Bd)))
+    }
+    Kd <- ncol(Bd)
+    n <- nrow(Bd)
+    distM <- matrix(0, n, n)
+    for (ii in seq_len(n - 1)) {
+      xi <- Bd[ii, ]
+      for (jj in (ii + 1):n) {
+        xj <- Bd[jj, ]
+        ok <- !is.na(xi) & !is.na(xj)
+        ks <- sum(ok)
+        dd <- if (ks >= 2) {
+          sqrt(sum((xi[ok] - xj[ok])^2)) * sqrt(Kd / ks)
+        } else {
+          Inf
+        }
+        distM[ii, jj] <- dd
+        distM[jj, ii] <- dd
+      }
+    }
+    if (any(!is.finite(distM))) {
+      fv <- distM[is.finite(distM)]
+      distM[!is.finite(distM)] <- (if (length(fv) > 0) max(fv) else 1) * 10
+    }
+    hc <- stats::hclust(stats::as.dist(distM), method = "ward.D2")
+    cl <- if (n >= 3) {
+      suppressMessages(dynamicTreeCut::cutreeDynamic(
+        dendro = hc,
+        distM = distM,
+        minClusterSize = minClusterSize,
+        method = "hybrid",
+        deepSplit = deep_split,
+        verbose = 0
+      ))
+    } else {
+      seq_len(n)
+    }
+    cl <- as.integer(cl)
+    names(cl) <- rownames(Bd)
+    cl_dt <- data.table::data.table(peptide = names(cl), cluster_id = cl)
+    sizes <- cl_dt[, .N, by = cluster_id]
+    good_ids <- sort(unique(sizes[cluster_id > 0 & N >= 2, cluster_id]))
+    cl_dt[, label := singleton_label]
+    if (length(good_ids) > 0) {
+      map <- data.table::data.table(
+        cluster_id = good_ids,
+        label = paste0("dCF", seq_along(good_ids))
+      )
+      cl_dt <- merge(
+        cl_dt,
+        map,
+        by = "cluster_id",
+        all.x = TRUE,
+        sort = FALSE,
+        suffixes = c("", ".m")
+      )
+      cl_dt[!is.na(label.m), label := label.m]
+      cl_dt[, label.m := NULL]
+    }
+    stats::setNames(cl_dt$label, cl_dt$peptide)
+  }
+
+  if (verbose) {
+    message(
+      "Running PEPTIDE-PRIOR eBayes pooled-sibling analysis on ",
+      nrow(DT),
+      " peptides from ",
+      data.table::uniqueN(DT[[group_col]]),
+      " proteins"
+    )
+  }
+
+  outg <- DT[, c(group_col, peptide_col, intensity_cols), with = FALSE]
+  outg[, discordant := FALSE]
+  outg[, dCF := canonical_label]
+
+  Y <- as.matrix(DT[, ..intensity_cols])
+  storage.mode(Y) <- "double"
+
+  # ---- filter peptides ----
+  n_samples <- ncol(Y)
+  min_total_non_na <- ceiling(n_samples * min_total_non_na_frac)
+  counts <- .counts_by_condition(Y)
+  keep <- (rowSums(!is.na(Y)) >= min_total_non_na) &
+    (rowSums(counts >= min_reps_per_condition) >= min_conditions)
+
+  if (verbose) {
+    message(
+      "Filtering: n_samples=",
+      n_samples,
+      ", min_total_non_na=",
+      min_total_non_na,
+      ", K (conditions)=",
+      K
+    )
+    message(
+      "  Peptides passing total filter: ",
+      sum(rowSums(!is.na(Y)) >= min_total_non_na)
+    )
+    message(
+      "  Peptides passing condition filter: ",
+      sum(rowSums(counts >= min_reps_per_condition) >= min_conditions)
+    )
+    message("  Peptides passing both filters: ", sum(keep))
+  }
+
+  if (sum(keep) < 2) {
+    if (verbose) {
+      message(
+        "Insufficient peptides passed filtering. Returning all as canonical."
+      )
+    }
+    outg[, n_cond_tested := NA_integer_]
+    outg[, p_min_bh_feature := NA_real_]
+    outg[, p_adj := NA_real_]
+    return(list(
+      peptide_results = outg[,
+        c(
+          group_col,
+          peptide_col,
+          intensity_cols,
+          "n_cond_tested",
+          "p_min_bh_feature",
+          "p_adj",
+          "discordant",
+          "dCF"
+        ),
+        with = FALSE
+      ],
+      condition_results = data.table::data.table()
+    ))
+  }
+
+  Yk <- Y[keep, , drop = FALSE]
+  pepK <- DT[[peptide_col]][keep]
+  P <- nrow(Yk)
+
+  mk <- function(fill = NA_real_) {
+    matrix(fill, nrow = P, ncol = K, dimnames = list(pepK, cond_levels))
+  }
+  mean_i <- mk()
+  var_i <- mk()
+  n_i <- mk(0L)
+  pool_mean <- mk()
+  pool_var <- mk()
+  pool_n <- mk(0L)
+  t_mat <- mk()
+  df_mat <- mk()
+  p_mat <- mk()
+  fc_mat <- mk()
+
+  # ---- Pass 1: per-condition LOO statistics ----
+  for (kk in seq_along(cond_levels)) {
+    cc <- cond_levels[kk]
+    cols_cc <- intensity_cols[cond == cc]
+    X <- Yk[, cols_cc, drop = FALSE]
+
+    ni <- rowSums(!is.na(X))
+    si <- rowSums(X, na.rm = TRUE)
+    ssi <- rowSums(X * X, na.rm = TRUE)
+    mi <- si / ni
+    vi <- (ssi - (si * si) / ni) / pmax(ni - 1, 1)
+
+    Ntot <- sum(ni)
+    Stot <- sum(si, na.rm = TRUE)
+    SStot <- sum(ssi, na.rm = TRUE)
+    Nex <- Ntot - ni
+    Sex <- Stot - si
+    SSex <- SStot - ssi
+    mex <- Sex / Nex
+    vex <- (SSex - (Sex * Sex) / Nex) / pmax(Nex - 1, 1)
+
+    n_i[, kk] <- as.integer(ni)
+    mean_i[, kk] <- mi
+    var_i[, kk] <- vi
+    pool_n[, kk] <- as.integer(Nex)
+    pool_mean[, kk] <- mex
+    pool_var[, kk] <- vex
+    fc_mat[, kk] <- mi - mex
+  }
+
+  # ---- EMPIRICAL BAYES VARIANCE MODERATION (peptide variances only) ----
+  # Prior is estimated exclusively from peptide-level replicate variances,
+  # which are the only exchangeable quantities in this context.
+  # Pool variances (sigma^2 + tau^2) are a different kind of quantity and
+  # are excluded to avoid contaminating the peptide prior.
+  pep_vars <- as.vector(var_i)
+  pep_df <- as.vector(pmax(n_i - 1, 1))
+  ok_pep <- is.finite(pep_df) & pep_df > 0 & is.finite(pep_vars) & pep_vars > 0
+
+  eb_method <- "moM"
+  d0 <- 4
+  s0_sq <- stats::median(pep_vars[ok_pep], na.rm = TRUE)
+
+  if (sum(ok_pep) >= 10) {
+    if (requireNamespace("limma", quietly = TRUE)) {
+      eb_fit <- tryCatch(
+        limma::fitFDist(pep_vars[ok_pep], df1 = pep_df[ok_pep]),
+        error = function(e) NULL
+      )
+      if (!is.null(eb_fit)) {
+        d0 <- eb_fit$df1
+        s0_sq <- eb_fit$scale
+        eb_method <- "limma::fitFDist (peptide-only)"
+      } else {
+        mv <- mean(pep_vars[ok_pep])
+        vv <- stats::var(pep_vars[ok_pep])
+        if (vv > 0 && mv > 0) {
+          d0 <- max(2 * mv^2 / vv + 4, 1)
+          s0_sq <- mv * (d0 - 2) / d0
+        }
+      }
+    } else {
+      mv <- mean(pep_vars[ok_pep])
+      vv <- stats::var(pep_vars[ok_pep])
+      if (vv > 0 && mv > 0) {
+        d0 <- max(2 * mv^2 / vv + 4, 1)
+        s0_sq <- mv * (d0 - 2) / d0
+      }
+    }
+  }
+
+  if (!is.numeric(d0) || length(d0) != 1 || !is.finite(d0) || d0 <= 0) {
+    mv <- mean(pep_vars[ok_pep], na.rm = TRUE)
+    vv <- stats::var(pep_vars[ok_pep], na.rm = TRUE)
+    d0 <- if (vv > 0 && mv > 0) max(2 * mv^2 / vv + 4, 1) else 4
+    s0_sq <- if (vv > 0 && mv > 0) mv * (d0 - 2) / d0 else mv
+    eb_method <- "moM"
+  }
+  if (!is.numeric(s0_sq) || !is.finite(s0_sq) || s0_sq <= 0) {
+    s0_sq <- 1e-6
+  }
+
+  if (verbose) {
+    message("Empirical Bayes variance moderation (peptide prior only):")
+    message("  Method    = ", eb_method)
+    message("  Prior df  (d0)    = ", round(d0, 2))
+    message("  Prior var (s0^2)  = ", round(s0_sq, 4))
+  }
+
+  # ---- Pass 2: moderated test statistics ----
+  # Peptide variance is eBayes-shrunk toward the peptide-only prior.
+  # Pool variance is used as a direct sample estimate (no shrinkage); its
+  # df = Nex - 1 enters the Satterthwaite formula directly.
+  for (kk in seq_along(cond_levels)) {
+    ok <- is.finite(mean_i[, kk]) &
+      is.finite(pool_mean[, kk]) &
+      (n_i[, kk] >= min_reps_per_condition) &
+      (pool_n[, kk] >= 2) &
+      is.finite(var_i[, kk]) &
+      var_i[, kk] >= 0 &
+      is.finite(pool_var[, kk]) &
+      pool_var[, kk] >= 0
+
+    if (any(ok)) {
+      df_i <- pmax(n_i[ok, kk] - 1, 1)
+
+      # Moderate peptide variance toward the peptide-only prior
+      var_i_mod <- (d0 * s0_sq + df_i * var_i[ok, kk]) / (d0 + df_i)
+
+      # Pool SE: raw estimate — no eBayes shrinkage.
+      # var_pool captures sigma^2 + tau^2 under H0 (exchangeability), giving
+      # the correct denominator variance for the pool mean.
+      df_pool <- pmax(pool_n[ok, kk] - 1, 1)
+      a <- var_i_mod / n_i[ok, kk]
+      b <- pool_var[ok, kk] / pool_n[ok, kk]
+
+      se2 <- a + b
+      tval <- (mean_i[ok, kk] - pool_mean[ok, kk]) / sqrt(se2)
+
+      # Satterthwaite df: eBayes effective df for peptide, direct df for pool
+      df_satt <- (a + b)^2 / ((a^2) / (d0 + df_i) + (b^2) / df_pool)
+
+      t_mat[ok, kk] <- tval
+      df_mat[ok, kk] <- df_satt
+      p_mat[ok, kk] <- 2 * stats::pt(-abs(tval), df = df_satt)
+    }
+  }
+
+  # ---- feature-level BH over conditions, then global BH ----
+  n_cond_tested <- apply(p_mat, 1, function(x) sum(is.finite(x)))
+  p_min_bh_feature <- apply(p_mat, 1, .double_bh_p, min_m = min_conditions)
+
+  p_adj <- rep(NA_real_, length(p_min_bh_feature))
+  ok_s <- is.finite(p_min_bh_feature)
+  if (any(ok_s)) {
+    p_adj[ok_s] <- stats::p.adjust(
+      p_min_bh_feature[ok_s],
+      method = adjust_method
+    )
+  }
+
+  disc <- ok_s & is.finite(p_adj) & (p_adj < alpha)
+
+  idx <- which(keep)
+  outg[, n_cond_tested := NA_integer_]
+  outg[, p_min_bh_feature := NA_real_]
+  outg[, p_adj := NA_real_]
+  data.table::set(
+    outg,
+    i = idx,
+    j = "n_cond_tested",
+    value = as.integer(n_cond_tested)
+  )
+  data.table::set(
+    outg,
+    i = idx,
+    j = "p_min_bh_feature",
+    value = p_min_bh_feature
+  )
+  data.table::set(outg, i = idx, j = "p_adj", value = p_adj)
+  outg[idx, discordant := disc]
+
+  if (verbose) {
+    message(sum(disc, na.rm = TRUE), " peptides marked as discordant")
+  }
+
+  # ---- clustering on deviation profiles ----
+  deviation <- mean_i - pool_mean
+  rownames(deviation) <- pepK
+  disc_peps <- pepK[disc]
+  outg[, dCF := canonical_label]
+
+  if (length(disc_peps) == 1) {
+    outg[get(peptide_col) %in% disc_peps, dCF := singleton_label]
+  } else if (length(disc_peps) > 1) {
+    Bd <- deviation[disc_peps, , drop = FALSE]
+    labs <- .cluster_from_deviation(Bd)
+    outg[get(peptide_col) %in% names(labs), dCF := labs[get(peptide_col)]]
+  }
+
+  # ---- condition-level table ----
+  cond_res <- data.table::data.table()
+  if (return_condition_tests) {
+    cond_res <- data.table::as.data.table(as.table(p_mat))
+    data.table::setnames(cond_res, c("peptide", "condition", "p_value"))
+    cond_res[, t_stat := as.vector(t_mat)]
+    cond_res[, df := as.vector(df_mat)]
+    cond_res[, deviation := as.vector(deviation)]
+    cond_res[, fold_change := as.vector(fc_mat)]
+    cond_res[, mean_peptide := as.vector(mean_i)]
+    cond_res[, mean_pool := as.vector(pool_mean)]
+    cond_res[, n_peptide := as.vector(n_i)]
+    cond_res[, n_pool := as.vector(pool_n)]
+    cond_res <- cond_res[is.finite(p_value)]
+  }
+
+  list(
+    peptide_results = outg[,
+      c(
+        group_col,
+        peptide_col,
+        intensity_cols,
+        "n_cond_tested",
+        "p_min_bh_feature",
+        "p_adj",
+        "discordant",
+        "dCF"
+      ),
+      with = FALSE
+    ],
+    condition_results = cond_res
+  )
+}
+
+#' Discover complexoforms with dual peptide/pool eBayes priors
+#'
+#' Extends `discover_complexoforms` by applying symmetric empirical Bayes
+#' shrinkage to both variance components:
+#'
+#' - The **peptide SE** is shrunk toward a prior estimated from peptide-level
+#'   replicate variances only (identical to `discover_complexoforms`).
+#'
+#' - The **pool SE** is shrunk toward a prior estimated from pool variances
+#'   across all conditions. Pool variances are exchangeable (each estimates
+#'   sigma^2 + tau^2 under the exchangeability H0), so borrowing strength
+#'   across conditions is valid. Shrinkage stabilises noisy per-condition pool
+#'   variance estimates, reducing upward bias when Nex is moderate.
+#'
+#' The Satterthwaite degrees of freedom use `(d0 + df_i)` for the moderated
+#' peptide component and `(d0_pool + df_pool)` for the moderated pool
+#' component, reflecting the increased effective sample size from borrowing.
+#'
+#' @inheritParams discover_complexoforms
+#'
+#' @return A list with:
+#'
+#'   - `peptide_results`: data.table of peptide-level results with discordance
+#'     and dCF assignments.
+#'   - `condition_results`: data.table of per-condition tests (if requested).
+#'
+#' @export
+discover_complexoforms_pool <- function(
+  complex_data,
+  intensity_cols,
+  group_col = "Gene name",
+  peptide_col = "Peptide",
+  alpha = 0.05,
+  adjust_method = "BH",
+  min_total_non_na_frac = 0.40,
+  min_conditions = 2,
+  min_reps_per_condition = 2,
+  deep_split = 2,
+  minClusterSize = 2,
+  cond_regex = "^(C_[0-9]+)_R_[0-9]+$",
+  canonical_label = "dCF0",
+  singleton_label = "dCF-1",
+  return_condition_tests = FALSE,
+  verbose = FALSE
+) {
+  if (!requireNamespace("data.table", quietly = TRUE)) {
+    stop("Please install data.table")
+  }
+  if (!requireNamespace("dynamicTreeCut", quietly = TRUE)) {
+    stop("Please install dynamicTreeCut")
+  }
+
+  DT <- data.table::as.data.table(complex_data)
+
+  # ---- ensure peptide ID ----
+  if (!peptide_col %in% names(DT)) {
+    needed_cols <- c(
+      "Accession",
+      "Position in master protein",
+      "Modifications in master protein",
+      "datatype"
+    )
+    if (all(needed_cols %in% names(DT))) {
+      DT[,
+        (peptide_col) := apply(.SD, 1, function(x) paste(x, collapse = "_")),
+        .SDcols = needed_cols
+      ]
+    } else {
+      stop(
+        "Cannot create peptide identifier column. Provide '",
+        peptide_col,
+        "' or columns: ",
+        paste(needed_cols, collapse = ", ")
+      )
+    }
+  }
+
+  if (!group_col %in% names(DT)) {
+    stop("Missing grouping column: ", group_col)
+  }
+  missing_int <- setdiff(intensity_cols, names(DT))
+  if (length(missing_int) > 0) {
+    stop("Missing intensity columns: ", paste(missing_int, collapse = ", "))
+  }
+
+  # ---- parse conditions ----
+  cond_chr <- sub(cond_regex, "\\1", intensity_cols, perl = TRUE)
+  if (any(cond_chr == intensity_cols)) {
+    alt_regex <- "^[A-Za-z0-9]+_[A-Za-z]+[0-9]+_(D[0-9]+)$"
+    cond_chr2 <- sub(alt_regex, "\\1", intensity_cols, perl = TRUE)
+    if (any(cond_chr2 == intensity_cols)) {
+      stop(
+        "Could not parse conditions from intensity_cols.\nTried cond_regex='",
+        cond_regex,
+        "' and alt_regex='",
+        alt_regex,
+        "'."
+      )
+    } else {
+      cond_chr <- cond_chr2
+      if (verbose) {
+        message(
+          "Auto-detected H9 format. Using condition pattern: D17, D19, etc."
+        )
+      }
+    }
+  }
+
+  cond <- factor(cond_chr)
+  cond_levels <- levels(cond)
+  K <- length(cond_levels)
+
+  # ---- helpers ----
+  .counts_by_condition <- function(Y) {
+    counts <- sapply(cond_levels, function(cc) {
+      cols_cc <- intensity_cols[cond == cc]
+      rowSums(!is.na(Y[, cols_cc, drop = FALSE]))
+    })
+    as.matrix(counts)
+  }
+
+  .double_bh_p <- function(p_row, min_m = 2) {
+    p <- p_row[is.finite(p_row)]
+    if (length(p) < min_m) {
+      return(NA_real_)
+    }
+    min(stats::p.adjust(p, method = "BH"))
+  }
+
+  .cluster_from_deviation <- function(Bd) {
+    if (nrow(Bd) < 2) {
+      return(setNames(rep(singleton_label, nrow(Bd)), rownames(Bd)))
+    }
+    Kd <- ncol(Bd)
+    n <- nrow(Bd)
+    distM <- matrix(0, n, n)
+    for (ii in seq_len(n - 1)) {
+      xi <- Bd[ii, ]
+      for (jj in (ii + 1):n) {
+        xj <- Bd[jj, ]
+        ok <- !is.na(xi) & !is.na(xj)
+        ks <- sum(ok)
+        dd <- if (ks >= 2) {
+          sqrt(sum((xi[ok] - xj[ok])^2)) * sqrt(Kd / ks)
+        } else {
+          Inf
+        }
+        distM[ii, jj] <- dd
+        distM[jj, ii] <- dd
+      }
+    }
+    if (any(!is.finite(distM))) {
+      fv <- distM[is.finite(distM)]
+      distM[!is.finite(distM)] <- (if (length(fv) > 0) max(fv) else 1) * 10
+    }
+    hc <- stats::hclust(stats::as.dist(distM), method = "ward.D2")
+    cl <- if (n >= 3) {
+      suppressMessages(dynamicTreeCut::cutreeDynamic(
+        dendro = hc,
+        distM = distM,
+        minClusterSize = minClusterSize,
+        method = "hybrid",
+        deepSplit = deep_split,
+        verbose = 0
+      ))
+    } else {
+      seq_len(n)
+    }
+    cl <- as.integer(cl)
+    names(cl) <- rownames(Bd)
+    cl_dt <- data.table::data.table(peptide = names(cl), cluster_id = cl)
+    sizes <- cl_dt[, .N, by = cluster_id]
+    good_ids <- sort(unique(sizes[cluster_id > 0 & N >= 2, cluster_id]))
+    cl_dt[, label := singleton_label]
+    if (length(good_ids) > 0) {
+      map <- data.table::data.table(
+        cluster_id = good_ids,
+        label = paste0("dCF", seq_along(good_ids))
+      )
+      cl_dt <- merge(
+        cl_dt,
+        map,
+        by = "cluster_id",
+        all.x = TRUE,
+        sort = FALSE,
+        suffixes = c("", ".m")
+      )
+      cl_dt[!is.na(label.m), label := label.m]
+      cl_dt[, label.m := NULL]
+    }
+    stats::setNames(cl_dt$label, cl_dt$peptide)
+  }
+
+  if (verbose) {
+    message(
+      "Running DUAL-PRIOR eBayes pooled-sibling analysis on ",
+      nrow(DT),
+      " peptides from ",
+      data.table::uniqueN(DT[[group_col]]),
+      " proteins"
+    )
+  }
+
+  outg <- DT[, c(group_col, peptide_col, intensity_cols), with = FALSE]
+  outg[, discordant := FALSE]
+  outg[, dCF := canonical_label]
+
+  Y <- as.matrix(DT[, ..intensity_cols])
+  storage.mode(Y) <- "double"
+
+  # ---- filter peptides ----
+  n_samples <- ncol(Y)
+  min_total_non_na <- ceiling(n_samples * min_total_non_na_frac)
+  counts <- .counts_by_condition(Y)
+  keep <- (rowSums(!is.na(Y)) >= min_total_non_na) &
+    (rowSums(counts >= min_reps_per_condition) >= min_conditions)
+
+  if (verbose) {
+    message(
+      "Filtering: n_samples=",
+      n_samples,
+      ", min_total_non_na=",
+      min_total_non_na,
+      ", K (conditions)=",
+      K
+    )
+    message(
+      "  Peptides passing total filter: ",
+      sum(rowSums(!is.na(Y)) >= min_total_non_na)
+    )
+    message(
+      "  Peptides passing condition filter: ",
+      sum(rowSums(counts >= min_reps_per_condition) >= min_conditions)
+    )
+    message("  Peptides passing both filters: ", sum(keep))
+  }
+
+  if (sum(keep) < 2) {
+    if (verbose) {
+      message(
+        "Insufficient peptides passed filtering. Returning all as canonical."
+      )
+    }
+    outg[, n_cond_tested := NA_integer_]
+    outg[, p_min_bh_feature := NA_real_]
+    outg[, p_adj := NA_real_]
+    return(list(
+      peptide_results = outg[,
+        c(
+          group_col,
+          peptide_col,
+          intensity_cols,
+          "n_cond_tested",
+          "p_min_bh_feature",
+          "p_adj",
+          "discordant",
+          "dCF"
+        ),
+        with = FALSE
+      ],
+      condition_results = data.table::data.table()
+    ))
+  }
+
+  Yk <- Y[keep, , drop = FALSE]
+  pepK <- DT[[peptide_col]][keep]
+  P <- nrow(Yk)
+
+  mk <- function(fill = NA_real_) {
+    matrix(fill, nrow = P, ncol = K, dimnames = list(pepK, cond_levels))
+  }
+  mean_i <- mk()
+  var_i <- mk()
+  n_i <- mk(0L)
+  pool_mean <- mk()
+  pool_var <- mk()
+  pool_n <- mk(0L)
+  t_mat <- mk()
+  df_mat <- mk()
+  p_mat <- mk()
+  fc_mat <- mk()
+
+  # ---- Pass 1: per-condition LOO statistics ----
+  for (kk in seq_along(cond_levels)) {
+    cc <- cond_levels[kk]
+    cols_cc <- intensity_cols[cond == cc]
+    X <- Yk[, cols_cc, drop = FALSE]
+
+    ni <- rowSums(!is.na(X))
+    si <- rowSums(X, na.rm = TRUE)
+    ssi <- rowSums(X * X, na.rm = TRUE)
+    mi <- si / ni
+    vi <- (ssi - (si * si) / ni) / pmax(ni - 1, 1)
+
+    Ntot <- sum(ni)
+    Stot <- sum(si, na.rm = TRUE)
+    SStot <- sum(ssi, na.rm = TRUE)
+    Nex <- Ntot - ni
+    Sex <- Stot - si
+    SSex <- SStot - ssi
+    mex <- Sex / Nex
+    vex <- (SSex - (Sex * Sex) / Nex) / pmax(Nex - 1, 1)
+
+    n_i[, kk] <- as.integer(ni)
+    mean_i[, kk] <- mi
+    var_i[, kk] <- vi
+    pool_n[, kk] <- as.integer(Nex)
+    pool_mean[, kk] <- mex
+    pool_var[, kk] <- vex
+    fc_mat[, kk] <- mi - mex
+  }
+
+  # ---- PEPTIDE eBayes prior (replicate noise only) ----
+  # Borrowing strength across peptide-level replicate variances.
+  .fit_eb_prior <- function(vars, dfs) {
+    ok <- is.finite(dfs) & dfs > 0 & is.finite(vars) & vars > 0
+    d0 <- 4
+    s0 <- stats::median(vars[ok], na.rm = TRUE)
+    mth <- "moM"
+    if (sum(ok) >= 10 && requireNamespace("limma", quietly = TRUE)) {
+      fit <- tryCatch(
+        limma::fitFDist(vars[ok], df1 = dfs[ok]),
+        error = function(e) NULL
+      )
+      if (!is.null(fit)) {
+        d0 <- fit$df1
+        s0 <- fit$scale
+        mth <- "limma::fitFDist"
+      }
+    }
+    if (!is.numeric(d0) || length(d0) != 1 || !is.finite(d0) || d0 <= 0) {
+      mv <- mean(vars[ok], na.rm = TRUE)
+      vv <- stats::var(vars[ok], na.rm = TRUE)
+      d0 <- if (vv > 0 && mv > 0) max(2 * mv^2 / vv + 4, 1) else 4
+      s0 <- if (vv > 0 && mv > 0) mv * (d0 - 2) / d0 else mv
+      mth <- "moM"
+    }
+    if (!is.numeric(s0) || !is.finite(s0) || s0 <= 0) {
+      s0 <- 1e-6
+    }
+    list(d0 = d0, s0_sq = s0, method = mth)
+  }
+
+  pep_prior <- .fit_eb_prior(as.vector(var_i), as.vector(pmax(n_i - 1, 1)))
+  pool_prior <- .fit_eb_prior(
+    as.vector(pool_var),
+    as.vector(pmax(pool_n - 1, 1))
+  )
+
+  d0 <- pep_prior$d0
+  s0_sq <- pep_prior$s0_sq
+  d0_pool <- pool_prior$d0
+  s0_pool_sq <- pool_prior$s0_sq
+
+  if (verbose) {
+    message("Empirical Bayes variance moderation (dual prior):")
+    message(
+      "  Peptide prior — method: ",
+      pep_prior$method,
+      "  d0=",
+      round(d0, 2),
+      "  s0^2=",
+      round(s0_sq, 4)
+    )
+    message(
+      "  Pool prior    — method: ",
+      pool_prior$method,
+      "  d0=",
+      round(d0_pool, 2),
+      "  s0^2=",
+      round(s0_pool_sq, 4)
+    )
+  }
+
+  # ---- Pass 2: moderated test statistics ----
+  # Both peptide and pool variances are eBayes-shrunk toward their respective
+  # priors. The Satterthwaite df uses the moderated effective df for each term.
+  for (kk in seq_along(cond_levels)) {
+    ok <- is.finite(mean_i[, kk]) &
+      is.finite(pool_mean[, kk]) &
+      (n_i[, kk] >= min_reps_per_condition) &
+      (pool_n[, kk] >= 2) &
+      is.finite(var_i[, kk]) &
+      var_i[, kk] >= 0 &
+      is.finite(pool_var[, kk]) &
+      pool_var[, kk] >= 0
+
+    if (any(ok)) {
+      df_i <- pmax(n_i[ok, kk] - 1, 1)
+      df_pool <- pmax(pool_n[ok, kk] - 1, 1)
+
+      var_i_mod <- (d0 * s0_sq + df_i * var_i[ok, kk]) / (d0 + df_i)
+      var_pool_mod <- (d0_pool * s0_pool_sq + df_pool * pool_var[ok, kk]) /
+        (d0_pool + df_pool)
+
+      a <- var_i_mod / n_i[ok, kk]
+      b <- var_pool_mod / pool_n[ok, kk]
+
+      se2 <- a + b
+      tval <- (mean_i[ok, kk] - pool_mean[ok, kk]) / sqrt(se2)
+
+      # Satterthwaite df with moderated effective df for both terms
+      df_satt <- (a + b)^2 / ((a^2) / (d0 + df_i) + (b^2) / (d0_pool + df_pool))
+
+      t_mat[ok, kk] <- tval
+      df_mat[ok, kk] <- df_satt
+      p_mat[ok, kk] <- 2 * stats::pt(-abs(tval), df = df_satt)
+    }
+  }
+
+  # ---- feature-level BH over conditions, then global BH ----
+  n_cond_tested <- apply(p_mat, 1, function(x) sum(is.finite(x)))
+  p_min_bh_feature <- apply(p_mat, 1, .double_bh_p, min_m = min_conditions)
+
+  p_adj <- rep(NA_real_, length(p_min_bh_feature))
+  ok_s <- is.finite(p_min_bh_feature)
+  if (any(ok_s)) {
+    p_adj[ok_s] <- stats::p.adjust(
+      p_min_bh_feature[ok_s],
+      method = adjust_method
+    )
+  }
+
+  disc <- ok_s & is.finite(p_adj) & (p_adj < alpha)
+
+  idx <- which(keep)
+  outg[, n_cond_tested := NA_integer_]
+  outg[, p_min_bh_feature := NA_real_]
+  outg[, p_adj := NA_real_]
+  data.table::set(
+    outg,
+    i = idx,
+    j = "n_cond_tested",
+    value = as.integer(n_cond_tested)
+  )
+  data.table::set(
+    outg,
+    i = idx,
+    j = "p_min_bh_feature",
+    value = p_min_bh_feature
+  )
+  data.table::set(outg, i = idx, j = "p_adj", value = p_adj)
+  outg[idx, discordant := disc]
+
+  if (verbose) {
+    message(sum(disc, na.rm = TRUE), " peptides marked as discordant")
+  }
+
+  # ---- clustering on deviation profiles ----
+  deviation <- mean_i - pool_mean
+  rownames(deviation) <- pepK
+  disc_peps <- pepK[disc]
+  outg[, dCF := canonical_label]
+
+  if (length(disc_peps) == 1) {
+    outg[get(peptide_col) %in% disc_peps, dCF := singleton_label]
+  } else if (length(disc_peps) > 1) {
+    Bd <- deviation[disc_peps, , drop = FALSE]
+    labs <- .cluster_from_deviation(Bd)
+    outg[get(peptide_col) %in% names(labs), dCF := labs[get(peptide_col)]]
+  }
+
+  # ---- condition-level table ----
+  cond_res <- data.table::data.table()
+  if (return_condition_tests) {
+    cond_res <- data.table::as.data.table(as.table(p_mat))
+    data.table::setnames(cond_res, c("peptide", "condition", "p_value"))
+    cond_res[, t_stat := as.vector(t_mat)]
+    cond_res[, df := as.vector(df_mat)]
+    cond_res[, deviation := as.vector(deviation)]
+    cond_res[, fold_change := as.vector(fc_mat)]
+    cond_res[, mean_peptide := as.vector(mean_i)]
+    cond_res[, mean_pool := as.vector(pool_mean)]
+    cond_res[, n_peptide := as.vector(n_i)]
+    cond_res[, n_pool := as.vector(pool_n)]
+    cond_res <- cond_res[is.finite(p_value)]
+  }
+
+  list(
+    peptide_results = outg[,
+      c(
+        group_col,
+        peptide_col,
+        intensity_cols,
+        "n_cond_tested",
+        "p_min_bh_feature",
+        "p_adj",
+        "discordant",
+        "dCF"
+      ),
+      with = FALSE
+    ],
+    condition_results = cond_res
+  )
+}
+
+
+#' Discover initial complexoforms by pooled-sibling testing and clustering
+#'
+#' Identifies discordant peptides within each protein (complex) by comparing
+#' each peptide's condition-specific profile against its pooled siblings, then
+#' clusters discordant peptides by deviation profiles to assign initial
+#' complexoform labels (dCF).
+#'
+#' @param complex_data Data.frame/data.table with peptide-level intensities and
+#'   metadata.
+#' @param intensity_cols Character vector of intensity column names.
+#' @param group_col Column used to group peptides (typically protein/gene).
+#' @param peptide_col Peptide identifier column; if missing, a composite ID is
+#'   created from accession/position/modifications/datatype when available.
+#' @param alpha Significance threshold for calling discordant peptides.
+#' @param adjust_method Multiple-testing adjustment method for BH.
+#' @param min_total_non_na_frac Minimum fraction of non-missing values across
+#'   all samples required to keep a peptide.
+#' @param min_conditions Minimum number of conditions with sufficient replicates
+#'   required to keep a peptide.
+#' @param min_reps_per_condition Minimum replicates per condition to test.
+#' @param deep_split, minClusterSize Parameters passed to dynamicTreeCut.
+#' @param cond_regex Regex to parse condition from intensity column names.
+#' @param canonical_label Label assigned to non-discordant peptides.
+#' @param singleton_label Label assigned to singleton discordant peptides.
+#' @param return_condition_tests If TRUE, returns per-condition test results.
+#' @param verbose If TRUE, prints progress messages.
+#'
+#' @return A list with:
+#'
+#'   - `peptide_results`: data.table of peptide-level results with discordance
+#'     and dCF assignments.
+#'   - `condition_results`: data.table of per-condition tests (if requested).
+#'
+#' @export
+discover_complexoforms_old <- function(
+  complex_data,
+  intensity_cols,
+  group_col = "Gene name",
+  peptide_col = "Peptide",
+  alpha = 0.05,
+  adjust_method = "BH",
+  # minimum presence requirements
+  min_total_non_na_frac = 0.40,
+  min_conditions = 2,
+  min_reps_per_condition = 2,
+  # clustering parameters
+  deep_split = 2,
+  minClusterSize = 2,
+  # regex to parse condition from sample column names
+  cond_regex = "^(C_[0-9]+)_R_[0-9]+$",
+  canonical_label = "dCF0",
+  singleton_label = "dCF-1",
+  # whether to return per-condition tests
+  return_condition_tests = TRUE,
+  # verbose output
+  verbose = FALSE
+) {
+  # ---- dependencies ----
+  if (!requireNamespace("data.table", quietly = TRUE)) {
+    stop("Please install data.table")
+  }
+  if (!requireNamespace("dynamicTreeCut", quietly = TRUE)) {
+    stop("Please install dynamicTreeCut")
+  }
+
+  DT <- data.table::as.data.table(complex_data)
+
+  # ---- ensure peptide ID ----
+  if (!peptide_col %in% names(DT)) {
+    needed_cols <- c(
+      "Accession",
+      "Position in master protein",
+      "Modifications in master protein",
+      "datatype"
+    )
+    if (all(needed_cols %in% names(DT))) {
+      DT[,
+        (peptide_col) := apply(.SD, 1, function(x) {
+          paste(x, collapse = "_")
+        }),
+        .SDcols = needed_cols
+      ]
+    } else {
+      stop(
+        "Cannot create peptide identifier column. Provide '",
+        peptide_col,
+        "' or columns: ",
+        paste(needed_cols, collapse = ", ")
+      )
+    }
+  }
+
+  # ---- validate columns ----
+  if (!group_col %in% names(DT)) {
+    stop("Missing grouping column: ", group_col)
+  }
+  missing_int <- setdiff(intensity_cols, names(DT))
+  if (length(missing_int) > 0) {
+    stop("Missing intensity columns: ", paste(missing_int, collapse = ", "))
+  }
+
+  # ---- parse conditions ----
+  cond_chr <- sub(cond_regex, "\\1", intensity_cols, perl = TRUE)
+  if (any(cond_chr == intensity_cols)) {
+    alt_regex <- "^[A-Za-z0-9]+_[A-Za-z]+[0-9]+_(D[0-9]+)$"
+    cond_chr2 <- sub(alt_regex, "\\1", intensity_cols, perl = TRUE)
+    if (any(cond_chr2 == intensity_cols)) {
+      stop(
+        "Could not parse conditions from intensity_cols.\n",
+        "Tried cond_regex='",
+        cond_regex,
+        "' and alt_regex='",
+        alt_regex,
+        "'."
+      )
+    } else {
+      cond_chr <- cond_chr2
+      if (verbose) {
+        message(
+          "Auto-detected H9 format. Using condition pattern: D17, D19, etc."
+        )
+      }
+    }
+  }
+
+  cond <- factor(cond_chr)
+  cond_levels <- levels(cond)
+  K <- length(cond_levels)
+
+  # ---- helpers ----
+  .counts_by_condition <- function(Y) {
+    counts <- sapply(cond_levels, function(cc) {
+      cols_cc <- intensity_cols[cond == cc]
+      rowSums(!is.na(Y[, cols_cc, drop = FALSE]))
+    })
+    as.matrix(counts)
+  }
+
+  # Double BH correction per peptide: apply BH to p-values across conditions
+  .double_bh_p <- function(p_row, min_m = 2) {
+    p <- p_row[is.finite(p_row)]
+    m <- length(p)
+    if (m < min_m) {
+      return(NA_real_)
+    }
+    # Step 1: Apply BH correction across conditions for this peptide
+    p_adj_feature <- stats::p.adjust(p, method = "BH")
+    # Step 2: Take minimum BH-adjusted p-value
+    min(p_adj_feature)
+  }
+
+  .cluster_from_deviation <- function(Bd) {
+    if (nrow(Bd) < 2) {
+      return(setNames(rep(singleton_label, nrow(Bd)), rownames(Bd)))
+    }
+
+    Kd <- ncol(Bd)
+    n <- nrow(Bd)
+    distM <- matrix(0, n, n)
+
+    for (ii in seq_len(n - 1)) {
+      xi <- Bd[ii, ]
+      for (jj in (ii + 1):n) {
+        xj <- Bd[jj, ]
+        ok <- !is.na(xi) & !is.na(xj)
+        ks <- sum(ok)
+        if (ks >= 2) {
+          dd <- sqrt(sum((xi[ok] - xj[ok])^2))
+          dd <- dd * sqrt(Kd / ks)
+        } else {
+          dd <- Inf
+        }
+        distM[ii, jj] <- dd
+        distM[jj, ii] <- dd
+      }
+    }
+
+    if (any(!is.finite(distM))) {
+      finite_vals <- distM[is.finite(distM)]
+      big <- if (length(finite_vals) > 0) max(finite_vals) else 1
+      distM[!is.finite(distM)] <- big * 10
+    }
+
+    hc <- stats::hclust(stats::as.dist(distM), method = "ward.D2")
+
+    if (n >= 3) {
+      cl <- dynamicTreeCut::cutreeDynamic(
+        dendro = hc,
+        distM = distM,
+        minClusterSize = minClusterSize,
+        method = "hybrid",
+        deepSplit = deep_split,
+        verbose = 0
+      )
+    } else {
+      cl <- seq_len(n)
+    }
+
+    cl <- as.integer(cl)
+    names(cl) <- rownames(Bd)
+
+    cl_dt <- data.table::data.table(peptide = names(cl), cluster_id = cl)
+    sizes <- cl_dt[, .N, by = cluster_id]
+    good_ids <- sort(unique(sizes[cluster_id > 0 & N >= 2, cluster_id]))
+
+    cl_dt[, label := singleton_label]
+    if (length(good_ids) > 0) {
+      map <- data.table::data.table(
+        cluster_id = good_ids,
+        label = paste0("dCF", seq_along(good_ids))
+      )
+      cl_dt <- merge(
+        cl_dt,
+        map,
+        by = "cluster_id",
+        all.x = TRUE,
+        sort = FALSE,
+        suffixes = c("", ".m")
+      )
+      cl_dt[!is.na(label.m), label := label.m]
+      cl_dt[, label.m := NULL]
+    }
+
+    stats::setNames(cl_dt$label, cl_dt$peptide)
+  }
+
+  # ---- Build Y ----
+  if (verbose) {
+    message(
+      "Running DOUBLE BH pooled-sibling analysis (v2.2) on ",
+      nrow(DT),
+      " peptides from ",
+      data.table::uniqueN(DT[[group_col]]),
+      " proteins"
+    )
+  }
+
+  outg <- DT[, c(group_col, peptide_col, intensity_cols), with = FALSE]
+  outg[, discordant := FALSE]
+  outg[, dCF := canonical_label]
+
+  Y <- as.matrix(DT[, ..intensity_cols])
+  storage.mode(Y) <- "double"
+
+  # ---- filter peptides ----
+  n_samples <- ncol(Y)
+  min_total_non_na <- ceiling(n_samples * min_total_non_na_frac)
+  counts <- .counts_by_condition(Y)
+
+  keep <- (rowSums(!is.na(Y)) >= min_total_non_na) &
+    (rowSums(counts >= min_reps_per_condition) >= min_conditions)
+
+  if (verbose) {
+    message(
+      "Filtering: n_samples=",
+      n_samples,
+      ", min_total_non_na=",
+      min_total_non_na,
+      ", K (conditions)=",
+      K
+    )
+    message(
+      "  Peptides passing total filter: ",
+      sum(rowSums(!is.na(Y)) >= min_total_non_na)
+    )
+    message(
+      "  Peptides passing condition filter: ",
+      sum(rowSums(counts >= min_reps_per_condition) >= min_conditions)
+    )
+    message("  Peptides passing both filters: ", sum(keep))
+  }
+
+  if (sum(keep) < 2) {
+    if (verbose) {
+      message(
+        "Insufficient peptides passed filtering. Returning all as canonical."
+      )
+    }
+    outg[, n_cond_tested := NA_integer_]
+    outg[, p_min_bh_feature := NA_real_]
+    outg[, p_adj := NA_real_]
+    return(list(
+      peptide_results = outg[,
+        c(
+          group_col,
+          peptide_col,
+          intensity_cols,
+          "n_cond_tested",
+          "p_min_bh_feature",
+          "p_adj",
+          "discordant",
+          "dCF"
+        ),
+        with = FALSE
+      ],
+      condition_results = data.table::data.table()
+    ))
+  }
+
+  Yk <- Y[keep, , drop = FALSE]
+  pepK <- DT[[peptide_col]][keep]
+  P <- nrow(Yk)
+
+  # Matrices to store per-peptide per-condition results
+  mean_i <- matrix(
+    NA_real_,
+    nrow = P,
+    ncol = K,
+    dimnames = list(pepK, cond_levels)
+  )
+  var_i <- matrix(
+    NA_real_,
+    nrow = P,
+    ncol = K,
+    dimnames = list(pepK, cond_levels)
+  )
+  n_i <- matrix(0L, nrow = P, ncol = K, dimnames = list(pepK, cond_levels))
+
+  pool_mean <- matrix(
+    NA_real_,
+    nrow = P,
+    ncol = K,
+    dimnames = list(pepK, cond_levels)
+  )
+  pool_var <- matrix(
+    NA_real_,
+    nrow = P,
+    ncol = K,
+    dimnames = list(pepK, cond_levels)
+  )
+  pool_n <- matrix(0L, nrow = P, ncol = K, dimnames = list(pepK, cond_levels))
+
+  t_mat <- matrix(
+    NA_real_,
+    nrow = P,
+    ncol = K,
+    dimnames = list(pepK, cond_levels)
+  )
+  df_mat <- matrix(
+    NA_real_,
+    nrow = P,
+    ncol = K,
+    dimnames = list(pepK, cond_levels)
+  )
+  p_mat <- matrix(
+    NA_real_,
+    nrow = P,
+    ncol = K,
+    dimnames = list(pepK, cond_levels)
+  )
+  fc_mat <- matrix(
+    NA_real_,
+    nrow = P,
+    ncol = K,
+    dimnames = list(pepK, cond_levels)
+  )
+
+  # ---- per-condition pooled stats with moderated variance ----
+  # Compute peptide-level and pool-level statistics
+  for (kk in seq_along(cond_levels)) {
+    cc <- cond_levels[kk]
+    cols_cc <- intensity_cols[cond == cc]
+    X <- Yk[, cols_cc, drop = FALSE]
+
+    ni <- rowSums(!is.na(X))
+    si <- rowSums(X, na.rm = TRUE)
+    ssi <- rowSums(X * X, na.rm = TRUE)
+
+    mi <- si / ni
+    vi <- (ssi - (si * si) / ni) / pmax(ni - 1, 1)
+
+    Ntot <- sum(ni)
+    Stot <- sum(si, na.rm = TRUE)
+    SStot <- sum(ssi, na.rm = TRUE)
+
+    Nex <- Ntot - ni
+    Sex <- Stot - si
+    SSex <- SStot - ssi
+
+    mex <- Sex / Nex
+    vex <- (SSex - (Sex * Sex) / Nex) / pmax(Nex - 1, 1)
+
+    n_i[, kk] <- as.integer(ni)
+    mean_i[, kk] <- mi
+    var_i[, kk] <- vi
+
+    pool_n[, kk] <- as.integer(Nex)
+    pool_mean[, kk] <- mex
+    pool_var[, kk] <- vex
+
+    # Calculate fold change (in log2 space, data should already be log2)
+    fc_mat[, kk] <- mi - mex
+  }
+
+  # ---- EMPIRICAL BAYES VARIANCE MODERATION ----
+  # Collect all variances for empirical Bayes estimation
+  all_variances <- c(as.vector(var_i), as.vector(pool_var))
+  all_variances <- all_variances[is.finite(all_variances) & all_variances > 0]
+
+  eb_method <- "moM"
+  if (length(all_variances) >= 10) {
+    if (requireNamespace("limma", quietly = TRUE)) {
+      df_i_all <- pmax(as.vector(n_i) - 1, 1)
+      df_pool_all <- pmax(as.vector(pool_n) - 1, 1)
+      df_all <- c(df_i_all, df_pool_all)
+      ok_all <- is.finite(df_all) &
+        df_all > 0 &
+        is.finite(c(as.vector(var_i), as.vector(pool_var)))
+      df_all <- df_all[ok_all]
+      var_all <- c(as.vector(var_i), as.vector(pool_var))
+      var_all <- var_all[ok_all]
+
+      eb_fit <- tryCatch(
+        limma::fitFDist(var_all, df1 = df_all),
+        error = function(e) NULL
+      )
+
+      if (!is.null(eb_fit)) {
+        d0 <- eb_fit$df1
+        s0_sq <- eb_fit$scale
+        eb_method <- "limma::fitFDist"
+      } else {
+        mean_var <- mean(all_variances, na.rm = TRUE)
+        var_var <- stats::var(all_variances, na.rm = TRUE)
+
+        if (var_var > 0 && mean_var > 0) {
+          d0 <- 2 * mean_var^2 / var_var + 4
+          d0 <- max(d0, 1)
+          s0_sq <- mean_var * (d0 - 2) / d0
+        } else {
+          d0 <- 4
+          s0_sq <- mean_var
+        }
+      }
+    } else {
+      mean_var <- mean(all_variances, na.rm = TRUE)
+      var_var <- stats::var(all_variances, na.rm = TRUE)
+
+      if (var_var > 0 && mean_var > 0) {
+        d0 <- 2 * mean_var^2 / var_var + 4
+        d0 <- max(d0, 1)
+        s0_sq <- mean_var * (d0 - 2) / d0
+      } else {
+        d0 <- 4
+        s0_sq <- mean_var
+      }
+    }
+  } else {
+    d0 <- 0.1
+    s0_sq <- stats::median(all_variances, na.rm = TRUE)
+  }
+
+  # Ensure numeric scalars for reporting and downstream use
+  if (!is.numeric(d0) || length(d0) != 1 || !is.finite(d0)) {
+    mean_var <- mean(all_variances, na.rm = TRUE)
+    var_var <- stats::var(all_variances, na.rm = TRUE)
+    if (var_var > 0 && mean_var > 0) {
+      d0 <- 2 * mean_var^2 / var_var + 4
+      d0 <- max(d0, 1)
+      s0_sq <- mean_var * (d0 - 2) / d0
+      eb_method <- "moM"
+    } else {
+      d0 <- 4
+      s0_sq <- mean_var
+      eb_method <- "moM"
+    }
+  }
+  if (
+    !is.numeric(s0_sq) || length(s0_sq) != 1 || !is.finite(s0_sq) || s0_sq <= 0
+  ) {
+    s0_sq <- 1e-6
+  }
+
+  if (verbose) {
+    message("Empirical Bayes variance moderation:")
+    message("  Method = ", eb_method)
+    message("  Prior df (d0) = ", round(d0, 2))
+    message("  Prior variance (s0^2) = ", round(s0_sq, 4))
+  }
+
+  # ---- Apply moderated statistics ----
+  for (kk in seq_along(cond_levels)) {
+    ok <- is.finite(mean_i[, kk]) &
+      is.finite(pool_mean[, kk]) &
+      (n_i[, kk] >= min_reps_per_condition) &
+      (pool_n[, kk] >= 2) &
+      is.finite(var_i[, kk]) &
+      is.finite(pool_var[, kk]) &
+      (var_i[, kk] >= 0) &
+      (pool_var[, kk] >= 0)
+
+    if (any(ok)) {
+      # Moderated variances using empirical Bayes shrinkage
+      # Posterior variance = weighted average of observed and prior
+      df_i <- pmax(n_i[ok, kk] - 1, 1)
+      df_pool <- pmax(pool_n[ok, kk] - 1, 1)
+
+      # Moderate peptide variance
+      var_i_mod <- (d0 * s0_sq + df_i * var_i[ok, kk]) / (d0 + df_i)
+
+      # Moderate pool variance
+      var_pool_mod <- (d0 * s0_sq + df_pool * pool_var[ok, kk]) / (d0 + df_pool)
+
+      # Standard error with moderated variance
+      se2 <- (var_i_mod / n_i[ok, kk]) + (var_pool_mod / pool_n[ok, kk])
+      tval <- (mean_i[ok, kk] - pool_mean[ok, kk]) / sqrt(se2)
+
+      # Moderated degrees of freedom (Satterthwaite with prior)
+      a <- var_i_mod / n_i[ok, kk]
+      b <- var_pool_mod / pool_n[ok, kk]
+      df <- (a + b)^2 / ((a^2) / (d0 + df_i) + (b^2) / (d0 + df_pool))
+
+      pval <- 2 * stats::pt(-abs(tval), df = df)
+
+      t_mat[ok, kk] <- tval
+      df_mat[ok, kk] <- df
+      p_mat[ok, kk] <- pval
+    }
+  }
+
+  # ════════════════════════════════════════════════════════════════════════
+  # FEATURE-LEVEL BH CORRECTION (within each peptide across conditions)
+  # ════════════════════════════════════════════════════════════════════════
+  n_cond_tested <- apply(p_mat, 1, function(x) sum(is.finite(x)))
+  p_min_bh_feature <- apply(p_mat, 1, .double_bh_p, min_m = min_conditions)
+
+  # ════════════════════════════════════════════════════════════════════════
+  # GLOBAL-LEVEL BH CORRECTION (across all peptides)
+  # ════════════════════════════════════════════════════════════════════════
+  p_adj <- rep(NA_real_, length(p_min_bh_feature))
+  ok_s <- is.finite(p_min_bh_feature)
+  if (any(ok_s)) {
+    p_adj[ok_s] <- stats::p.adjust(
+      p_min_bh_feature[ok_s],
+      method = adjust_method
+    )
+  }
+
+  # Discordant if: significant p-value
+  disc <- ok_s & is.finite(p_adj) & (p_adj < alpha)
+
+  # write peptide-level results back into outg
+  idx <- which(keep)
+  outg[, n_cond_tested := NA_integer_]
+  outg[, p_min_bh_feature := NA_real_]
+  outg[, p_adj := NA_real_]
+
+  data.table::set(
+    outg,
+    i = idx,
+    j = "n_cond_tested",
+    value = as.integer(n_cond_tested)
+  )
+  data.table::set(
+    outg,
+    i = idx,
+    j = "p_min_bh_feature",
+    value = p_min_bh_feature
+  )
+  data.table::set(outg, i = idx, j = "p_adj", value = p_adj)
+
+  outg[idx, discordant := disc]
+
+  n_discordant <- sum(disc, na.rm = TRUE)
+  if (verbose) {
+    message(
+      n_discordant,
+      " peptides marked as discordant (double BH: feature + global)"
+    )
+  }
+
+  # ---- clustering on deviation profiles (only discordant peptides) ----
+  deviation <- mean_i - pool_mean
+  rownames(deviation) <- pepK
+
+  disc_peps <- pepK[disc]
+  outg[, dCF := canonical_label]
+
+  if (length(disc_peps) == 1) {
+    outg[get(peptide_col) %in% disc_peps, dCF := singleton_label]
+  } else if (length(disc_peps) > 1) {
+    Bd <- deviation[disc_peps, , drop = FALSE]
+    labs <- .cluster_from_deviation(Bd)
+    outg[get(peptide_col) %in% names(labs), dCF := labs[get(peptide_col)]]
+  }
+
+  # ---- condition-level table ----
+  cond_res <- data.table::data.table()
+  if (return_condition_tests) {
+    cond_res <- data.table::as.data.table(as.table(p_mat))
+    data.table::setnames(cond_res, c("peptide", "condition", "p_value"))
+    cond_res[, t_stat := as.vector(t_mat)]
+    cond_res[, df := as.vector(df_mat)]
+    cond_res[, deviation := as.vector(deviation)]
+    cond_res[, fold_change := as.vector(fc_mat)]
+    cond_res[, mean_peptide := as.vector(mean_i)]
+    cond_res[, mean_pool := as.vector(pool_mean)]
+    cond_res[, n_peptide := as.vector(n_i)]
+    cond_res[, n_pool := as.vector(pool_n)]
+    cond_res <- cond_res[is.finite(p_value)]
+
+    list(
+      peptide_results = outg[,
+        c(
+          group_col,
+          peptide_col,
+          intensity_cols,
+          "n_cond_tested",
+          "p_min_bh_feature",
+          "p_adj",
+          "discordant",
+          "dCF"
+        ),
+        with = FALSE
+      ],
+      condition_results = cond_res
+    )
+  } else {
+    # Return only peptide results when condition tests not requested
+    list(
+      peptide_results = outg[,
+        c(
+          group_col,
+          peptide_col,
+          intensity_cols,
+          "n_cond_tested",
+          "p_min_bh_feature",
+          "p_adj",
+          "discordant",
+          "dCF"
+        ),
+        with = FALSE
+      ]
+    )
+  }
+}
+
+
+#' Discover initial complexoforms without variance moderation
+#'
+#' Variant of `discover_complexoforms` that uses raw pooled-sibling statistics
+#' with double BH correction (feature-level then global), without empirical
+#' Bayes variance moderation.
+#'
+#' @inheritParams discover_complexoforms
+#' @param return_condition_tests If TRUE, returns per-condition test results.
+#'
+#' @return A list with:
+#'
+#'   - `peptide_results`: data.table of peptide-level results with discordance
+#'     and dCF assignments.
+#'   - `condition_results`: data.table of per-condition tests (if requested).
+#'
+#' @export
+
+discover_complexoforms_no_bayes <- function(
+  complex_data,
+  intensity_cols,
+  group_col = "Gene name",
+  peptide_col = "Peptide",
+  alpha = 0.05,
+  adjust_method = "BH",
+  # minimum presence requirements
+  min_total_non_na_frac = 0.40,
+  min_conditions = 2,
+  min_reps_per_condition = 2,
+  # clustering parameters
+  deep_split = 2,
+  minClusterSize = 2,
+  # regex to parse condition from sample column names
+  cond_regex = "^(C_[0-9]+)_R_[0-9]+$",
+  canonical_label = "dCF0",
+  singleton_label = "dCF-1",
+  # whether to return per-condition tests
+  return_condition_tests = FALSE,
+  # verbose output
+  verbose = FALSE
+) {
+  # ---- dependencies ----
+  if (!requireNamespace("data.table", quietly = TRUE)) {
+    stop("Please install data.table")
+  }
+  if (!requireNamespace("dynamicTreeCut", quietly = TRUE)) {
+    stop("Please install dynamicTreeCut")
+  }
+
+  DT <- data.table::as.data.table(complex_data)
+
+  # ---- ensure peptide ID ----
+  if (!peptide_col %in% names(DT)) {
+    needed_cols <- c(
+      "Accession",
+      "Position in master protein",
+      "Modifications in master protein",
+      "datatype"
+    )
+    if (all(needed_cols %in% names(DT))) {
+      DT[,
+        (peptide_col) := apply(.SD, 1, function(x) {
+          paste(x, collapse = "_")
+        }),
+        .SDcols = needed_cols
+      ]
+    } else {
+      stop(
+        "Cannot create peptide identifier column. Provide '",
+        peptide_col,
+        "' or columns: ",
+        paste(needed_cols, collapse = ", ")
+      )
+    }
+  }
+
+  # ---- validate columns ----
+  if (!group_col %in% names(DT)) {
+    stop("Missing grouping column: ", group_col)
+  }
+  missing_int <- setdiff(intensity_cols, names(DT))
+  if (length(missing_int) > 0) {
+    stop("Missing intensity columns: ", paste(missing_int, collapse = ", "))
+  }
+
+  # ---- parse conditions ----
+  cond_chr <- sub(cond_regex, "\\1", intensity_cols, perl = TRUE)
+  if (any(cond_chr == intensity_cols)) {
+    alt_regex <- "^[A-Za-z0-9]+_[A-Za-z]+[0-9]+_(D[0-9]+)$"
+    cond_chr2 <- sub(alt_regex, "\\1", intensity_cols, perl = TRUE)
+    if (any(cond_chr2 == intensity_cols)) {
+      stop(
+        "Could not parse conditions from intensity_cols.\n",
+        "Tried cond_regex='",
+        cond_regex,
+        "' and alt_regex='",
+        alt_regex,
+        "'."
+      )
+    } else {
+      cond_chr <- cond_chr2
+      if (verbose) {
+        message(
+          "Auto-detected H9 format. Using condition pattern: D17, D19, etc."
+        )
+      }
+    }
+  }
+
+  cond <- factor(cond_chr)
+  cond_levels <- levels(cond)
+  K <- length(cond_levels)
+
+  # ---- helpers ----
+  .counts_by_condition <- function(Y) {
+    counts <- sapply(cond_levels, function(cc) {
+      cols_cc <- intensity_cols[cond == cc]
+      rowSums(!is.na(Y[, cols_cc, drop = FALSE]))
+    })
+    as.matrix(counts)
+  }
+
+  # Double BH correction per peptide: apply BH to p-values across conditions
+  .double_bh_p <- function(p_row, min_m = 2) {
+    p <- p_row[is.finite(p_row)]
+    m <- length(p)
+    if (m < min_m) {
+      return(NA_real_)
+    }
+    # Step 1: Apply BH correction across conditions for this peptide
+    p_adj_feature <- stats::p.adjust(p, method = "BH")
+    # Step 2: Take minimum BH-adjusted p-value
+    min(p_adj_feature)
+  }
+
+  .cluster_from_deviation <- function(Bd) {
+    if (nrow(Bd) < 2) {
+      return(setNames(rep(singleton_label, nrow(Bd)), rownames(Bd)))
+    }
+
+    Kd <- ncol(Bd)
+    n <- nrow(Bd)
+    distM <- matrix(0, n, n)
+
+    for (ii in seq_len(n - 1)) {
+      xi <- Bd[ii, ]
+      for (jj in (ii + 1):n) {
+        xj <- Bd[jj, ]
+        ok <- !is.na(xi) & !is.na(xj)
+        ks <- sum(ok)
+        if (ks >= 2) {
+          dd <- sqrt(sum((xi[ok] - xj[ok])^2))
+          dd <- dd * sqrt(Kd / ks)
+        } else {
+          dd <- Inf
+        }
+        distM[ii, jj] <- dd
+        distM[jj, ii] <- dd
+      }
+    }
+
+    if (any(!is.finite(distM))) {
+      finite_vals <- distM[is.finite(distM)]
+      big <- if (length(finite_vals) > 0) max(finite_vals) else 1
+      distM[!is.finite(distM)] <- big * 10
+    }
+
+    hc <- stats::hclust(stats::as.dist(distM), method = "ward.D2")
+
+    if (n >= 3) {
+      cl <- suppressMessages(
+        dynamicTreeCut::cutreeDynamic(
+          dendro = hc,
+          distM = distM,
+          minClusterSize = minClusterSize,
+          method = "hybrid",
+          deepSplit = deep_split,
+          verbose = 0
+        )
+      )
+    } else {
+      cl <- seq_len(n)
+    }
+
+    cl <- as.integer(cl)
+    names(cl) <- rownames(Bd)
+
+    cl_dt <- data.table::data.table(peptide = names(cl), cluster_id = cl)
+    sizes <- cl_dt[, .N, by = cluster_id]
+    good_ids <- sort(unique(sizes[cluster_id > 0 & N >= 2, cluster_id]))
+
+    cl_dt[, label := singleton_label]
+    if (length(good_ids) > 0) {
+      map <- data.table::data.table(
+        cluster_id = good_ids,
+        label = paste0("dCF", seq_along(good_ids))
+      )
+      cl_dt <- merge(
+        cl_dt,
+        map,
+        by = "cluster_id",
+        all.x = TRUE,
+        sort = FALSE,
+        suffixes = c("", ".m")
+      )
+      cl_dt[!is.na(label.m), label := label.m]
+      cl_dt[, label.m := NULL]
+    }
+
+    stats::setNames(cl_dt$label, cl_dt$peptide)
+  }
+
+  # ---- Build Y ----
+  if (verbose) {
+    message(
+      "Running DOUBLE BH pooled-sibling analysis (no EB) on ",
+      nrow(DT),
+      " peptides from ",
+      data.table::uniqueN(DT[[group_col]]),
+      " proteins"
+    )
+  }
+
+  outg <- DT[, c(group_col, peptide_col, intensity_cols), with = FALSE]
+  outg[, discordant := FALSE]
+  outg[, dCF := canonical_label]
+
+  Y <- as.matrix(DT[, ..intensity_cols])
+  storage.mode(Y) <- "double"
+
+  # ---- filter peptides ----
+  n_samples <- ncol(Y)
+  min_total_non_na <- ceiling(n_samples * min_total_non_na_frac)
+  counts <- .counts_by_condition(Y)
+
+  keep <- (rowSums(!is.na(Y)) >= min_total_non_na) &
+    (rowSums(counts >= min_reps_per_condition) >= min_conditions)
+
+  if (verbose) {
+    message(
+      "Filtering: n_samples=",
+      n_samples,
+      ", min_total_non_na=",
+      min_total_non_na,
+      ", K (conditions)=",
+      K
+    )
+    message(
+      "  Peptides passing total filter: ",
+      sum(rowSums(!is.na(Y)) >= min_total_non_na)
+    )
+    message(
+      "  Peptides passing condition filter: ",
+      sum(rowSums(counts >= min_reps_per_condition) >= min_conditions)
+    )
+    message("  Peptides passing both filters: ", sum(keep))
+  }
+
+  if (sum(keep) < 2) {
+    if (verbose) {
+      message(
+        "Insufficient peptides passed filtering. Returning all as canonical."
+      )
+    }
+    outg[, n_cond_tested := NA_integer_]
+    outg[, p_min_bh_feature := NA_real_]
+    outg[, p_adj := NA_real_]
+    return(list(
+      peptide_results = outg[,
+        c(
+          group_col,
+          peptide_col,
+          intensity_cols,
+          "n_cond_tested",
+          "p_min_bh_feature",
+          "p_adj",
+          "discordant",
+          "dCF"
+        ),
+        with = FALSE
+      ],
+      condition_results = data.table::data.table()
+    ))
+  }
+
+  Yk <- Y[keep, , drop = FALSE]
+  pepK <- DT[[peptide_col]][keep]
+  P <- nrow(Yk)
+
+  # Matrices to store per-peptide per-condition results
+  mean_i <- matrix(
+    NA_real_,
+    nrow = P,
+    ncol = K,
+    dimnames = list(pepK, cond_levels)
+  )
+  var_i <- matrix(
+    NA_real_,
+    nrow = P,
+    ncol = K,
+    dimnames = list(pepK, cond_levels)
+  )
+  n_i <- matrix(0L, nrow = P, ncol = K, dimnames = list(pepK, cond_levels))
+
+  pool_mean <- matrix(
+    NA_real_,
+    nrow = P,
+    ncol = K,
+    dimnames = list(pepK, cond_levels)
+  )
+  pool_var <- matrix(
+    NA_real_,
+    nrow = P,
+    ncol = K,
+    dimnames = list(pepK, cond_levels)
+  )
+  pool_n <- matrix(0L, nrow = P, ncol = K, dimnames = list(pepK, cond_levels))
+
+  t_mat <- matrix(
+    NA_real_,
+    nrow = P,
+    ncol = K,
+    dimnames = list(pepK, cond_levels)
+  )
+  df_mat <- matrix(
+    NA_real_,
+    nrow = P,
+    ncol = K,
+    dimnames = list(pepK, cond_levels)
+  )
+  p_mat <- matrix(
+    NA_real_,
+    nrow = P,
+    ncol = K,
+    dimnames = list(pepK, cond_levels)
+  )
+
+  # ---- per-condition pooled stats via sums / sumsquares (fast LOO) ----
+  for (kk in seq_along(cond_levels)) {
+    cc <- cond_levels[kk]
+    cols_cc <- intensity_cols[cond == cc]
+    X <- Yk[, cols_cc, drop = FALSE]
+
+    ni <- rowSums(!is.na(X))
+    si <- rowSums(X, na.rm = TRUE)
+    ssi <- rowSums(X * X, na.rm = TRUE)
+
+    mi <- si / ni
+    vi <- (ssi - (si * si) / ni) / pmax(ni - 1, 1)
+
+    Ntot <- sum(ni)
+    Stot <- sum(si, na.rm = TRUE)
+    SStot <- sum(ssi, na.rm = TRUE)
+
+    Nex <- Ntot - ni
+    Sex <- Stot - si
+    SSex <- SStot - ssi
+
+    mex <- Sex / Nex
+    vex <- (SSex - (Sex * Sex) / Nex) / pmax(Nex - 1, 1)
+
+    n_i[, kk] <- as.integer(ni)
+    mean_i[, kk] <- mi
+    var_i[, kk] <- vi
+
+    pool_n[, kk] <- as.integer(Nex)
+    pool_mean[, kk] <- mex
+    pool_var[, kk] <- vex
+
+    ok <- is.finite(mi) &
+      is.finite(mex) &
+      (ni >= min_reps_per_condition) &
+      (Nex >= 2) &
+      is.finite(vi) &
+      is.finite(vex) &
+      (vi >= 0) &
+      (vex >= 0)
+
+    if (any(ok)) {
+      se2 <- (vi[ok] / ni[ok]) + (vex[ok] / Nex[ok])
+      tval <- (mi[ok] - mex[ok]) / sqrt(se2)
+
+      a <- vi[ok] / ni[ok]
+      b <- vex[ok] / Nex[ok]
+      df <- (a + b)^2 /
+        ((a^2) / pmax(ni[ok] - 1, 1) + (b^2) / pmax(Nex[ok] - 1, 1))
+
+      pval <- 2 * stats::pt(-abs(tval), df = df)
+
+      t_mat[ok, kk] <- tval
+      df_mat[ok, kk] <- df
+      p_mat[ok, kk] <- pval
+    }
+  }
+
+  # ---- peptide-level double BH over conditions ----
+  n_cond_tested <- apply(p_mat, 1, function(x) sum(is.finite(x)))
+  p_min_bh_feature <- apply(p_mat, 1, .double_bh_p, min_m = min_conditions)
+
+  # ---- BH across peptides (min feature-level BH) ----
+  p_adj <- rep(NA_real_, length(p_min_bh_feature))
+  ok_s <- is.finite(p_min_bh_feature)
+  if (any(ok_s)) {
+    p_adj[ok_s] <- stats::p.adjust(
+      p_min_bh_feature[ok_s],
+      method = adjust_method
+    )
+  }
+
+  disc <- ok_s & is.finite(p_adj) & (p_adj < alpha)
+
+  # write peptide-level results back into outg
+  idx <- which(keep)
+  outg[, n_cond_tested := NA_integer_]
+  outg[, p_min_bh_feature := NA_real_]
+  outg[, p_adj := NA_real_]
+
+  data.table::set(
+    outg,
+    i = idx,
+    j = "n_cond_tested",
+    value = as.integer(n_cond_tested)
+  )
+  data.table::set(
+    outg,
+    i = idx,
+    j = "p_min_bh_feature",
+    value = p_min_bh_feature
+  )
+  data.table::set(outg, i = idx, j = "p_adj", value = p_adj)
+
+  outg[idx, discordant := disc]
+
+  n_discordant <- sum(disc, na.rm = TRUE)
+  if (verbose) {
+    message(
+      n_discordant,
+      " peptides marked as discordant (double BH: feature + global)"
+    )
+  }
+
+  # ---- clustering on deviation profiles (only discordant peptides) ----
+  deviation <- mean_i - pool_mean
+  rownames(deviation) <- pepK
+
+  disc_peps <- pepK[disc]
+  outg[, dCF := canonical_label]
+
+  if (length(disc_peps) == 1) {
+    outg[get(peptide_col) %in% disc_peps, dCF := singleton_label]
+  } else if (length(disc_peps) > 1) {
+    Bd <- deviation[disc_peps, , drop = FALSE]
+    labs <- .cluster_from_deviation(Bd)
+    outg[get(peptide_col) %in% names(labs), dCF := labs[get(peptide_col)]]
+  }
+
+  # ---- condition-level table ----
+  cond_res <- data.table::data.table()
+  if (return_condition_tests) {
+    cond_res <- data.table::as.data.table(as.table(p_mat))
+    data.table::setnames(cond_res, c("peptide", "condition", "p_value"))
+    cond_res[, t_stat := as.vector(t_mat)]
+    cond_res[, df := as.vector(df_mat)]
+    cond_res[, deviation := as.vector(deviation)]
+    cond_res[, mean_peptide := as.vector(mean_i)]
+    cond_res[, mean_pool := as.vector(pool_mean)]
+    cond_res[, n_peptide := as.vector(n_i)]
+    cond_res[, n_pool := as.vector(pool_n)]
+    cond_res <- cond_res[is.finite(p_value)]
+  }
+
+  list(
+    peptide_results = outg[,
+      c(
+        group_col,
+        peptide_col,
+        intensity_cols,
+        "n_cond_tested",
+        "p_min_bh_feature",
+        "p_adj",
+        "discordant",
+        "dCF"
+      ),
+      with = FALSE
+    ],
+    condition_results = cond_res
+  )
+}

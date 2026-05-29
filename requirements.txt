@@ -1,0 +1,7 @@
+# Python dependencies for Q-Benchmark scripts
+# ProteoForge is a local package downloaded automatically from:
+# https://github.com/LangeLab/ProteoForge_Analysis
+# No manual installation required.
+
+numpy
+pandas

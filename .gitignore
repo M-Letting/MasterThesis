@@ -1,0 +1,28 @@
+# Data and output files
+*.csv
+*.pdf
+*.feather
+*.png
+*.rds
+*.dat
+*.txt
+!requirements.txt
+*.cxc
+*.svg
+
+# AlphaFold cache + fetched structures (all locations)
+**/AfCache/
+**/AssembledComplexes/
+
+# R artifacts
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Python artifacts
+Q-Benchmark/02-DCF/__pycache__/
+
+# OS files
+.DS_Store
+Thumbs.db
