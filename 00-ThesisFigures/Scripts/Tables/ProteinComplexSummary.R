@@ -1,3 +1,7 @@
+# Libraries
+library(data.table)
+library(gt)
+
 # Set working directory to folder
 setwd(here::here("ComplexoFinder"))
 
@@ -247,7 +251,7 @@ for (complex in complexes) {
   num_free_cys <- nrow(data[datatype == "FreeCys"])
   num_rm_cys <- nrow(data[datatype == "RmCys"])
   num_phospho <- nrow(data[datatype == "Phospho"])
-  num_peptides <- nrow(data[datatype != "NM"])
+  num_peptides <- nrow(data[datatype == "NMpeptide"])
   total_features <- nrow(data)
 
   summary_table <- rbind(
@@ -315,4 +319,4 @@ gtsave(
   vwidth = 2900,
   vheight = 2100
 )
-?gtsave
+

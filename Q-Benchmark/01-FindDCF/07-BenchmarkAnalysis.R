@@ -23,7 +23,7 @@ dir.create(figure_dir, showWarnings = FALSE, recursive = TRUE)
 
 # Analysis parameters
 pthr <- 1e-3 # P-value threshold to highlight
-thresholds <- 10^seq(0, -15, length.out = 1000)
+thresholds <- 10^seq(0, -15, length.out = 10000)
 
 # Data scenarios
 data_ids <- c("1pep", "2pep", "050pep", "random")

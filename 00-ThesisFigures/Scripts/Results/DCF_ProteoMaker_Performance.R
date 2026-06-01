@@ -278,11 +278,11 @@ nona_highlights <- make_highlights(nona_scatter)
 
 # Panel builder
 make_panel <- function(sdata, highlights, lvl, title) {
-  ggplot(sdata[NALevel == lvl], aes(x = TPR, y = FDR, colour = method)) +
+  ggplot(sdata[NALevel == lvl], aes(x = TPR, y = 1 - FDR, colour = method)) +
     geom_point(size = 1.5, alpha = 0.5, shape = 16) +
     geom_point(
       data = highlights[NALevel == lvl],
-      aes(shape = thr_label, fill = method),
+      aes(x = TPR, y = 1 - FDR, shape = thr_label, fill = method),
       size = 3.5,
       color = "black",
       stroke = 0.6
@@ -295,7 +295,7 @@ make_panel <- function(sdata, highlights, lvl, title) {
     ) +
     scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.25)) +
     scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.25)) +
-    labs(title = title, x = "True Positive Rate", y = "False Discovery Rate") +
+    labs(title = title, x = "TPR", y = "1 - FDR") +
     theme_classic(base_size = 11) +
     theme(
       plot.title = element_text(face = "bold", hjust = 0.5, size = 12),
@@ -354,7 +354,7 @@ legend_method <- get_legend(
 )
 
 legend_shape <- get_legend(
-  ggplot(na_highlights, aes(x = TPR, y = FDR, shape = thr_label)) +
+  ggplot(na_highlights, aes(x = TPR, y = 1 - FDR, shape = thr_label)) +
     geom_point(size = 3.5, fill = "grey60", colour = "black", stroke = 0.6) +
     scale_shape_manual(
       values = c("p = 0.001" = 21, "p = 0.01" = 22, "p = 0.05" = 23),
@@ -369,21 +369,7 @@ legend_shape <- get_legend(
     )
 )
 
-# ── Assemble 2×3 grid ─────────────────────────────────────────────────────────
-
-row_na <- plot_grid(
-  plotlist = na_panels,
-  nrow = 1,
-  labels = c("A", "", ""),
-  label_size = 13
-)
-row_nona <- plot_grid(
-  plotlist = nona_panels,
-  nrow = 1,
-  labels = c("B", "", ""),
-  label_size = 13
-)
-grid_6 <- plot_grid(row_na, row_nona, ncol = 1)
+# ── Shared legends row ────────────────────────────────────────────────────────
 
 legends_row <- plot_grid(
   legend_method,
@@ -392,29 +378,111 @@ legends_row <- plot_grid(
   rel_widths = c(1.5, 0.8)
 )
 
-p_scatter_fig <- plot_grid(
-  grid_6,
+# ── F1 bar builder ────────────────────────────────────────────────────────────
+
+make_f1_bar <- function(highlights) {
+  f1_dat <- highlights[thr_label == "p = 0.01"]
+  ggplot(f1_dat, aes(x = NALevel, y = F1, fill = method)) +
+    geom_col(
+      position = position_dodge(width = 0.85),
+      width = 0.75,
+      alpha = 0.9,
+      color = "black",
+      linewidth = 0.25
+    ) +
+    geom_text(
+      aes(label = sprintf("%.2f", F1), color = method),
+      position = position_dodge(width = 0.85),
+      vjust = -0.35,
+      size = 3.0,
+      fontface = "bold",
+      show.legend = FALSE
+    ) +
+    scale_y_continuous(
+      limits = c(0, 1.2),
+      breaks = seq(0, 1, 0.25),
+      expand = expansion(mult = c(0, 0))
+    ) +
+    scale_fill_manual(values = method_colors, name = "Method") +
+    scale_color_manual(values = method_colors) +
+    labs(title = "F1 Score (p = 0.01)", y = "F1") +
+    bar_theme
+}
+
+# ── Figure 1: 50% NA ──────────────────────────────────────────────────────────
+
+row_na <- plot_grid(
+  plotlist = na_panels,
+  nrow = 1,
+  labels = c("A", "B", "C"),
+  label_size = 13
+)
+
+p_na_extended <- plot_grid(
+  row_na,
+  make_f1_bar(na_highlights),
   legends_row,
   ncol = 1,
-  rel_heights = c(1, 0.08)
+  labels = c("", "D", ""),
+  label_size = 13,
+  rel_heights = c(0.8, 0.55, 0.08)
 )
 
-print(p_scatter_fig)
-
-# ── Save ──────────────────────────────────────────────────────────────────────
+print(p_na_extended)
 
 ggsave(
-  "00-ThesisFigures/Figures/DCF_PM/DCF_ProteoMaker_Scatter.pdf",
-  p_scatter_fig,
+  "00-ThesisFigures/Figures/DCF_PM/DCF_ProteoMaker_NA_Extended.pdf",
+  p_na_extended,
   width = 12,
-  height = 8
+  height = 7
 )
 ggsave(
-  "00-ThesisFigures/Figures/DCF_PM/DCF_ProteoMaker_Scatter.png",
-  p_scatter_fig,
+  "00-ThesisFigures/Figures/DCF_PM/DCF_ProteoMaker_NA_Extended.png",
+  p_na_extended,
   width = 12,
-  height = 8,
+  height = 7,
   dpi = 300
 )
 
-cat("Saved: 00-ThesisFigures/Figures/DCF_PM/DCF_ProteoMaker_Scatter.pdf/.png\n")
+cat(
+  "Saved: 00-ThesisFigures/Figures/DCF_PM/DCF_ProteoMaker_NA_Extended.pdf/.png\n"
+)
+
+# ── Figure 2: No NA ───────────────────────────────────────────────────────────
+
+row_nona <- plot_grid(
+  plotlist = nona_panels,
+  nrow = 1,
+  labels = c("A", "B", "C"),
+  label_size = 13
+)
+
+p_nona_extended <- plot_grid(
+  row_nona,
+  make_f1_bar(nona_highlights),
+  legends_row,
+  ncol = 1,
+  labels = c("", "D", ""),
+  label_size = 13,
+  rel_heights = c(0.8, 0.55, 0.08)
+)
+
+print(p_nona_extended)
+
+ggsave(
+  "00-ThesisFigures/Figures/DCF_PM/DCF_ProteoMaker_NoNA_Extended.pdf",
+  p_nona_extended,
+  width = 12,
+  height = 7
+)
+ggsave(
+  "00-ThesisFigures/Figures/DCF_PM/DCF_ProteoMaker_NoNA_Extended.png",
+  p_nona_extended,
+  width = 12,
+  height = 7,
+  dpi = 300
+)
+
+cat(
+  "Saved: 00-ThesisFigures/Figures/DCF_PM/DCF_ProteoMaker_NoNA_Extended.pdf/.png\n"
+)

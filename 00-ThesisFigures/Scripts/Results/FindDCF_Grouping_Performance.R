@@ -289,12 +289,12 @@ scatter_highlights[,
 make_scatter_panel <- function(lvl, title) {
   ggplot(
     scatter_data[perturbation == lvl],
-    aes(x = TPR, y = FPR, colour = method)
+    aes(x = FPR, y = TPR, colour = method)
   ) +
     geom_point(size = 1.5, alpha = 0.5, shape = 16) +
     geom_point(
       data = scatter_highlights[perturbation == lvl],
-      aes(shape = thr_label, fill = method),
+      aes(x = FPR, y = TPR, shape = thr_label, fill = method),
       size = 3.5,
       color = "black",
       stroke = 0.6
@@ -307,7 +307,7 @@ make_scatter_panel <- function(lvl, title) {
     ) +
     scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.25)) +
     scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.25)) +
-    labs(title = title, x = "True Positive Rate", y = "False Positive Rate") +
+    labs(title = title, x = "False Positive Rate", y = "True Positive Rate") +
     theme_classic(base_size = 11) +
     theme(
       plot.title = element_text(face = "bold", hjust = 0.5, size = 12),
@@ -353,7 +353,7 @@ scatter_legend_method <- get_legend(
 )
 
 scatter_legend_shape <- get_legend(
-  ggplot(scatter_highlights, aes(x = TPR, y = FPR, shape = thr_label)) +
+  ggplot(scatter_highlights, aes(x = FPR, y = TPR, shape = thr_label)) +
     geom_point(size = 3.5, fill = "grey60", colour = "black", stroke = 0.6) +
     scale_shape_manual(
       values = c("p = 0.001" = 21, "p = 0.01" = 22, "p = 0.05" = 23),
@@ -411,4 +411,64 @@ ggsave(
 
 cat(
   "Saved: 00-ThesisFigures/Figures/FindDCF/FindDCF_Grouping_Scatter.pdf/.png\n"
+)
+
+# ── Extended figure: scatter + combined F1 bar ────────────────────────────────
+
+f1_at_001 <- scatter_highlights[thr_label == "p = 0.01"]
+
+p_f1_bar <- ggplot(f1_at_001, aes(x = perturbation, y = F1, fill = method)) +
+  geom_col(
+    position = position_dodge(width = 0.85),
+    width = 0.75,
+    alpha = 0.9,
+    color = "black",
+    linewidth = 0.25
+  ) +
+  geom_text(
+    aes(label = sprintf("%.2f", F1), color = method),
+    position = position_dodge(width = 0.85),
+    vjust = -0.35,
+    size = 3.0,
+    fontface = "bold",
+    show.legend = FALSE
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1.2),
+    breaks = seq(0, 1, 0.25),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  scale_fill_manual(values = method_colors, name = "Method") +
+  scale_color_manual(values = method_colors) +
+  labs(title = "F1 Score (p = 0.01)", y = "F1") +
+  bar_theme
+
+p_scatter_extended <- plot_grid(
+  scatter_grid,
+  p_f1_bar,
+  scatter_legends_row,
+  ncol = 1,
+  labels = c("", "D", ""),
+  label_size = 13,
+  rel_heights = c(1, 0.55, 0.08)
+)
+
+print(p_scatter_extended)
+
+ggsave(
+  "00-ThesisFigures/Figures/FindDCF/FindDCF_Grouping_Scatter_Extended.pdf",
+  p_scatter_extended,
+  width = 12,
+  height = 6
+)
+ggsave(
+  "00-ThesisFigures/Figures/FindDCF/FindDCF_Grouping_Scatter_Extended.png",
+  p_scatter_extended,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+
+cat(
+  "Saved: 00-ThesisFigures/Figures/FindDCF/FindDCF_Grouping_Scatter_Extended.pdf/.png\n"
 )
