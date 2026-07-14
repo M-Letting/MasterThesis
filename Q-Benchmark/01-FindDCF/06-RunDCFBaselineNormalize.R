@@ -264,7 +264,7 @@ for (i in seq_along(data_ids)) {
     # Try to run analysis on this protein
     tryCatch(
       {
-        result <- discover_complexoforms_new2(
+        result <- discover_complexoforms(
           complex_data = protein_data,
           intensity_cols = intensity_cols,
           group_col = "protein_id",
@@ -275,7 +275,7 @@ for (i in seq_along(data_ids)) {
           min_conditions = 2,
           min_reps_per_condition = 2,
           deep_split = 2,
-          minClusterSize = 2,
+          minClusterSize = 1,
           cond_regex = cond_regex,
           canonical_label = "dCF0",
           singleton_label = "dCF-1",
